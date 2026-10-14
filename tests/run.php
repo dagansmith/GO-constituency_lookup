@@ -73,8 +73,8 @@ $person = [
     'custom_fields' => ['unrelated' => 'preserve'],
 ];
 $match = ['items' => [
-    ['value' => ['name' => 'Historical name', 'isCurrent' => false]],
-    ['value' => ['name' => 'Cities of London and Westminster', 'isCurrent' => true]],
+    ['value' => ['name' => 'Historical name', 'endDate' => '2024-05-30T00:00:00']],
+    ['value' => ['name' => 'Cities of London and Westminster', 'endDate' => null]],
 ]];
 $tests = [
     'postcode normalization and validation' => static function (): void {
@@ -121,6 +121,25 @@ $tests = [
         same(1, count($http->calls));
         same([], $http->calls[0]['headers']);
     },
+    'native webhook batches, wrappers and canonical link precedence' => static function () use ($config, $person): void {
+        $an = new ActionNetworkClient(new FakeHttpClient(), $config);
+        $action = ['identifiers' => ['action_network:action-not-person'],
+            'person' => ['postal_addresses' => []],
+            '_links' => ['osdi:person' => ['href' => $config->anBaseUrl . '/people/person-2']]];
+        same('person-2', Webhook::personId($action, $an));
+        same(['person-2', 'person-1'], Webhook::personIds([
+            ['osdi:submission' => $action, 'idempotency_key' => 'synthetic', 'action_network:sponsor' => []],
+            ['osdi:person' => $person],
+            ['osdi:signature' => $action],
+        ], $an));
+        same(['person-2'], Webhook::personIds(['osdi:donation' => $action], $an));
+        same(['person-1'], Webhook::personIds(['person' => $person], $an));
+        fails(static fn () => Webhook::personIds([], $an));
+        fails(static fn () => Webhook::personIds([null], $an));
+        fails(static fn () => Webhook::personIds(['osdi:submission' => [
+            'identifiers' => ['action_network:action-not-person'],
+        ]], $an));
+    },
     'no-match caching, ambiguity and transient recovery' => static function () use ($config, $match): void {
         $http = new FakeHttpClient();
         $http->responses = [['items' => []], new RuntimeException('API request failed (HTTP 503).'), $match];
@@ -130,10 +149,12 @@ $tests = [
         fails(static fn () => $lookup->constituency('SW1A 1AA'));
         same('Cities of London and Westminster', $lookup->constituency('SW1A 1AA'));
         $http->responses = [['items' => [
-            ['value' => ['name' => 'One', 'isCurrent' => true]],
-            ['value' => ['name' => 'Two', 'isCurrent' => true]],
+            ['value' => ['name' => 'One', 'endDate' => null]],
+            ['value' => ['name' => 'Two', 'endDate' => null]],
         ]], ['unexpected' => 'response']];
         fails(static fn () => $lookup->constituency('B33 8TH'));
+        fails(static fn () => $lookup->constituency('B33 8TH'));
+        $http->responses = [['items' => $match['items'], 'totalResults' => 21]];
         fails(static fn () => $lookup->constituency('B33 8TH'));
     },
     'update contract, fresh reads and idempotence' => static function () use ($config, $person, $match): void {

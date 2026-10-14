@@ -54,13 +54,22 @@ try {
     respond(503, ['error' => 'Service configuration error; see server logs.']);
 }
 try {
-    $id = Webhook::personId($payload, $an);
+    $ids = Webhook::personIds($payload, $an);
 } catch (\Throwable $exception) {
     respond(400, ['error' => 'Payload must identify an Action Network person.']);
 }
-try {
-    $outcome = $enricher->process($id, 'webhook');
-    respond(200, ['outcome' => $outcome]);
-} catch (\Throwable $exception) {
-    respond(503, ['error' => 'Enrichment failed; retry later. The cron sweep will also retry.']);
+$outcomes = [];
+$failures = 0;
+foreach ($ids as $id) {
+    try {
+        $outcome = $enricher->process($id, 'webhook');
+        $outcomes[$outcome] = ($outcomes[$outcome] ?? 0) + 1;
+    } catch (\Throwable $exception) {
+        $failures++;
+    }
 }
+if ($failures > 0) {
+    respond(503, ['error' => 'Enrichment failed; retry later. The cron sweep will also retry.',
+        'outcomes' => $outcomes, 'errors' => $failures]);
+}
+respond(200, count($ids) === 1 ? ['outcome' => array_key_first($outcomes)] : ['outcomes' => $outcomes]);

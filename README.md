@@ -76,13 +76,20 @@ webhook configuration, redact query strings from reverse-proxy/access logs, and
 rotate the secret if the URL is exposed. Do not log request bodies. Authentication
 happens before parsing or API requests.
 
-Accepted payloads identify one person:
+Native AN deliveries are JSON arrays of event wrappers such as
+`[{"osdi:submission": {...}, "idempotency_key": "..."}]`. The service unwraps
+`osdi:*` resources, ignores sponsor/idempotency metadata, and processes every
+distinct person. A single event wrapper or these unwrapped payloads also work:
 
 - An AN person resource with `identifiers: ["action_network:PERSON_ID"]` or its
   canonical `_links.self.href`.
 - A wrapper with `person` containing that resource.
 - An OSDI action resource with `_links["osdi:person"].href` pointing to that
   group's AN API person endpoint.
+
+Canonical `osdi:person` links take priority over embedded person data (which
+native action webhooks may supply without identifiers). Action identifiers are
+never treated as person identifiers in event wrappers.
 
 If your webhook omits the AN identifier/link, adapt the upstream payload to
 include it; an email address alone is deliberately not accepted. The service
@@ -92,7 +99,10 @@ postcodes or custom fields.
 Responses: 200 with `updated`, `unchanged`, `invalid_postcode`, or `no_match`;
 400 malformed JSON or unsupported identity; 401 bad token; 405 wrong method;
 413 oversized body; 415 wrong content type; 503 configuration/API/lock failure.
-503 signals retry where the sender supports it; cron repairs failures regardless
+Batch responses contain outcome counters; one failed person does not prevent
+attempting other people, but the entire request returns 503 so it can be retried.
+Replayed successful items skip writes. Invalid identities reject the payload
+before any enrichment. 503 signals retry where the sender supports it; cron repairs failures regardless
 of the sender's retry policy. Invalid/no-match results leave any existing value
 untouched and are rechecked by cron.
 
@@ -100,8 +110,9 @@ untouched and are rechecked by cron.
 
 Postcodes are uppercased, whitespace-normalized, and checked for UK syntax.
 Syntax validation does not prove that a postcode exists. Parliament's constituency
-search receives `searchText`, `skip=0`, and `take=20`; only a single current
-constituency is accepted, and ambiguous results fail rather than guess.
+search receives `searchText`, `skip=0`, and `take=20`; only a single constituency
+with `endDate: null` is accepted. Historical, ambiguous, or truncated results
+are never guessed.
 
 AN person updates use **PUT**, not PATCH, with only the destination
 `custom_fields` entry. Other fields are not sent or replaced. An exact existing
@@ -206,5 +217,5 @@ only; deploy the real webhook with HTTPS.
 
 API references:
 [AN people and PUT updates](https://actionnetwork.org/docs/v2/people),
-[AN webhooks](https://actionnetwork.org/docs/v2/webhooks),
+[AN webhooks](https://actionnetwork.org/docs/webhooks),
 [Parliament Members API](https://members-api.parliament.uk/index.html).

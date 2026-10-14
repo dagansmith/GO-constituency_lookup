@@ -28,10 +28,15 @@ final class ParliamentLookup
         if (!isset($response['items']) || !is_array($response['items'])) {
             throw new \RuntimeException('Parliament response is missing constituency items.');
         }
+        if (($response['totalResults'] ?? count($response['items'])) > count($response['items'])) {
+            throw new \RuntimeException('Parliament returned an incomplete constituency result set.');
+        }
         $names = [];
         foreach ($response['items'] as $item) {
             $value = $item['value'] ?? [];
-            if (($value['isCurrent'] ?? false) === true && is_string($value['name'] ?? null)
+            // Constituencies use a nullable endDate, not an isCurrent flag.
+            if (array_key_exists('endDate', $value) && $value['endDate'] === null
+                && is_string($value['name'] ?? null)
                 && trim($value['name']) !== '') {
                 $names[] = trim($value['name']);
             }
