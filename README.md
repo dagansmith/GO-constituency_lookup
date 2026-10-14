@@ -52,6 +52,7 @@ sweep** repairs missed webhooks, failed writes, and changed postcodes.
 | `AN_POSTCODE_FIELD` | Empty: use primary `postal_addresses[].postal_code`, otherwise first address with a postcode. Set to a custom-field name if your group stores postcodes there. No fallback when an explicitly selected postcode is invalid. |
 | `AN_API_BASE_URL` | `https://actionnetwork.org/api/v2` |
 | `PARLIAMENT_LOOKUP_URL` | `https://members-api.parliament.uk/api/Location/Constituency/Search` |
+| `PARLIAMENT_MEMBERS_LOOKUP_URL` | `https://members-api.parliament.uk/api/Members/Search`; documented postcode fallback. |
 | `WEBHOOK_SECRET` | Required for webhook; at least 32 characters. Cron does not require it. |
 | `LOCK_DIRECTORY` | Repository `var/locks`; private absolute directory outside the public root. |
 | `HTTP_RETRIES` | `2` additional attempts; allowed 0–5. |
@@ -114,6 +115,15 @@ search receives `searchText`, `skip=0`, and `take=20`; only a single constituenc
 with `endDate: null` is accepted. Historical, ambiguous, or truncated results
 are never guessed.
 
+The published schema describes constituency `searchText` as a **name** search.
+If it yields no current match, the service uses the explicitly documented
+postcode query `Members/Search?Location=POSTCODE&House=1&IsCurrentMember=true`
+and reads `latestHouseMembership.membershipFrom` from a current Commons member.
+This fallback also requires one unambiguous constituency and shares the cache.
+If the constituency search cannot resolve a postcode and the seat is vacant
+(or Parliament is dissolved), the fallback may return `no_match`; the existing
+value is preserved and cron retries later.
+
 AN person updates use **PUT**, not PATCH, with only the destination
 `custom_fields` entry. Other fields are not sent or replaced. An exact existing
 match skips the write, including when the enrichment write triggers another
@@ -124,7 +134,7 @@ Network failures, 429, and 5xx receive bounded exponential retries (1s, 2s by
 default). `Retry-After` is respected up to a 5-second delay cap; persistent
 throttling is left for the next sweep. Other non-2xx responses fail immediately.
 The endpoint is synchronous: allow sufficient PHP/proxy execution time for
-up to three API operations and their retries. If your webhook sender times out
+up to four API operations per person and their retries. If your webhook sender times out
 sooner, cron still repairs the record. There is no durable webhook queue.
 
 **No database or per-person status custom fields are required.** AN is the

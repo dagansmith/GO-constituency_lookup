@@ -8,6 +8,7 @@ final class Config
     public readonly string $anToken;
     public readonly string $anBaseUrl;
     public readonly string $parliamentUrl;
+    public readonly string $parliamentMembersUrl;
     public readonly string $constituencyField;
     public readonly string $postcodeField;
     public readonly string $webhookSecret;
@@ -22,6 +23,10 @@ final class Config
         $this->parliamentUrl = self::env(
             'PARLIAMENT_LOOKUP_URL',
             'https://members-api.parliament.uk/api/Location/Constituency/Search'
+        );
+        $this->parliamentMembersUrl = self::env(
+            'PARLIAMENT_MEMBERS_LOOKUP_URL',
+            'https://members-api.parliament.uk/api/Members/Search'
         );
         $this->constituencyField = self::env('AN_CONSTITUENCY_FIELD', 'parliamentary_constituency');
         $this->postcodeField = self::env('AN_POSTCODE_FIELD');
@@ -39,7 +44,7 @@ final class Config
         if ($this->postcodeField !== '' && $this->postcodeField === $this->constituencyField) {
             throw new \RuntimeException('Postcode input and constituency output fields must be different.');
         }
-        foreach ([$this->anBaseUrl, $this->parliamentUrl] as $url) {
+        foreach ([$this->anBaseUrl, $this->parliamentUrl, $this->parliamentMembersUrl] as $url) {
             $parts = parse_url($url);
             if ($parts === false || ($parts['scheme'] ?? '') !== 'https' || empty($parts['host'])
                 || isset($parts['user']) || isset($parts['pass'])

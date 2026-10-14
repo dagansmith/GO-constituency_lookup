@@ -16,6 +16,6 @@ function constituencyService(): array
     $config = new Constituency\Config();
     $http = new Constituency\HttpClient($config->retries, $config->timeout);
     $an = new Constituency\ActionNetworkClient($http, $config);
-    $parliament = new Constituency\ParliamentLookup($http, $config->parliamentUrl);
+    $parliament = new Constituency\ParliamentLookup($http, $config->parliamentUrl, $config->parliamentMembersUrl);
     return [$config, $an, new Constituency\Enricher($an, $parliament, $config)];
 }

@@ -121,6 +121,31 @@ $tests = [
         same(1, count($http->calls));
         same([], $http->calls[0]['headers']);
     },
+    'documented postcode member fallback and cache' => static function () use ($config): void {
+        $http = new FakeHttpClient();
+        $http->responses = [['items' => []], ['items' => [['value' => [
+            'latestHouseMembership' => ['house' => 1, 'membershipEndDate' => null, 'membershipFrom' => 'Example seat'],
+        ]]]]];
+        $lookup = new ParliamentLookup($http, $config->parliamentUrl, $config->parliamentMembersUrl);
+        same('Example seat', $lookup->constituency('SW1A 1AA'));
+        same('Example seat', $lookup->constituency('sw1a1aa'));
+        same(2, count($http->calls));
+        parse_str(parse_url($http->calls[1]['url'], PHP_URL_QUERY), $query);
+        same('SW1A 1AA', $query['Location']);
+        same('1', $query['House']);
+        same('true', $query['IsCurrentMember']);
+        same([], $http->calls[1]['headers']);
+        $http->responses = [['items' => []], ['items' => []]];
+        same(null, $lookup->constituency('M1 1AE'));
+        same(null, $lookup->constituency('M11AE'));
+        same(4, count($http->calls));
+        $http->responses = [['items' => []], ['items' => [['value' => [
+            'latestHouseMembership' => ['house' => 1, 'membershipEndDate' => '2024-05-30', 'membershipFrom' => 'Old seat'],
+        ]]]]];
+        fails(static fn () => $lookup->constituency('B33 8TH'));
+        $http->responses = [['items' => [['value' => ['name' => 'Missing lifecycle']]]]];
+        fails(static fn () => $lookup->constituency('B33 8TH'));
+    },
     'native webhook batches, wrappers and canonical link precedence' => static function () use ($config, $person): void {
         $an = new ActionNetworkClient(new FakeHttpClient(), $config);
         $action = ['identifiers' => ['action_network:action-not-person'],
