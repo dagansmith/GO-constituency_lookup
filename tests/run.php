@@ -302,6 +302,8 @@ $tests = [
             'ENV_TEST_EMPTY=',
             'not a variable line',
             "ENV_TEST_CRLF=value\r",
+            'ENV_TEST_DUP=first',
+            'ENV_TEST_DUP=last',
         ]));
         putenv('ENV_TEST_PRESET=from-environment');
         same([5, 6, 7, 10], Env::load($path));
@@ -310,13 +312,14 @@ $tests = [
         same('double "q" $literal', getenv('ENV_TEST_C'));
         same('', getenv('ENV_TEST_EMPTY'));
         same('value', getenv('ENV_TEST_CRLF'));
+        same('last', getenv('ENV_TEST_DUP'));
         same('from-environment', getenv('ENV_TEST_PRESET'));
         foreach (['D', 'E', 'F'] as $suffix) {
             same(false, getenv("ENV_TEST_$suffix"));
         }
         same(false, file_exists($marker));
         same([], Env::load($workRoot . '/missing.env'));
-        foreach (['A', 'B', 'C', 'EMPTY', 'CRLF', 'PRESET'] as $suffix) {
+        foreach (['A', 'B', 'C', 'EMPTY', 'CRLF', 'DUP', 'PRESET'] as $suffix) {
             putenv("ENV_TEST_$suffix");
         }
     },

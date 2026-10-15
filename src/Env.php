@@ -20,12 +20,19 @@ final class Env
             throw new \RuntimeException('Cannot read the .env file; check its permissions.');
         }
         $invalid = [];
+        $values = [];
         foreach ($lines as $index => $line) {
             $parsed = self::parseLine($line);
             if ($parsed === false) {
                 $invalid[] = $index + 1;
-            } elseif ($parsed !== null && getenv($parsed[0]) === false) {
-                putenv($parsed[0] . '=' . $parsed[1]);
+            } elseif ($parsed !== null) {
+                // Like a shell, a later assignment in the file replaces an earlier one.
+                $values[$parsed[0]] = $parsed[1];
+            }
+        }
+        foreach ($values as $name => $value) {
+            if (getenv($name) === false) {
+                putenv($name . '=' . $value);
             }
         }
         return $invalid;
