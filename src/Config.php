@@ -13,6 +13,7 @@ final class Config
     public readonly string $postcodeField;
     public readonly string $webhookSecret;
     public readonly string $lockDirectory;
+    public readonly string $queueDirectory;
     public readonly int $retries;
     public readonly int $timeout;
 
@@ -32,6 +33,7 @@ final class Config
         $this->postcodeField = self::env('AN_POSTCODE_FIELD');
         $this->webhookSecret = self::env('WEBHOOK_SECRET');
         $this->lockDirectory = self::env('LOCK_DIRECTORY', dirname(__DIR__) . '/var/locks');
+        $this->queueDirectory = rtrim(self::env('QUEUE_DIRECTORY', dirname(__DIR__) . '/var/queue'), '/');
         $this->retries = self::integer('HTTP_RETRIES', 2, 0, 5);
         $this->timeout = self::integer('HTTP_TIMEOUT_SECONDS', 15, 1, 60);
 
@@ -54,6 +56,13 @@ final class Config
         }
         if (!str_starts_with($this->lockDirectory, '/')) {
             throw new \RuntimeException('LOCK_DIRECTORY must be an absolute path outside the public web root.');
+        }
+        $public = dirname(__DIR__) . '/public';
+        $realQueue = realpath($this->queueDirectory);
+        if (!str_starts_with($this->queueDirectory, '/') || preg_match('~(?:^|/)\.\.?(?:/|$)~', $this->queueDirectory)
+            || str_starts_with($this->queueDirectory . '/', $public . '/')
+            || ($realQueue !== false && str_starts_with($realQueue . '/', (realpath($public) ?: $public) . '/'))) {
+            throw new \RuntimeException('QUEUE_DIRECTORY must be an absolute path outside the public web root.');
         }
     }
 

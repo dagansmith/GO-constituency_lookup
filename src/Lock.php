@@ -5,6 +5,8 @@ namespace Constituency;
 
 final class Lock
 {
+    public const BUSY = 1;
+
     private $handle;
 
     public function __construct(string $directory, string $key)
@@ -21,7 +23,7 @@ final class Lock
         if (!flock($this->handle, LOCK_EX | LOCK_NB)) {
             fclose($this->handle);
             $this->handle = null;
-            throw new \RuntimeException('Processing is already in progress; retry later.');
+            throw new \RuntimeException('Processing is already in progress; retry later.', self::BUSY);
         }
     }
 

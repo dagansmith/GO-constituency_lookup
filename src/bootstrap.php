@@ -11,6 +11,18 @@ spl_autoload_register(static function (string $class): void {
     }
 });
 
+// Web servers often do not pass the shell/cron environment to PHP, so read the
+// private root .env as data. Variables already in the environment win.
+try {
+    $invalidEnvLines = Constituency\Env::load(dirname(__DIR__) . '/.env');
+    if ($invalidEnvLines !== []) {
+        Constituency\Logger::log('env_file_lines_ignored', ['lines' => $invalidEnvLines]);
+    }
+} catch (\Throwable $exception) {
+    Constituency\Logger::log('env_file_error', ['error' => $exception->getMessage()]);
+}
+unset($invalidEnvLines);
+
 function constituencyService(): array
 {
     $config = new Constituency\Config();

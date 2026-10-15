@@ -4,6 +4,7 @@ declare(strict_types=1);
 require dirname(__DIR__) . '/src/bootstrap.php';
 
 use Constituency\Logger;
+use Constituency\Queue;
 use Constituency\Webhook;
 
 header('Content-Type: application/json');
@@ -28,14 +29,17 @@ if ($secret === false || strlen(trim($secret)) < 32) {
 }
 $token = $_SERVER['HTTP_X_WEBHOOK_TOKEN'] ?? $_GET['token'] ?? null;
 if (!Webhook::authenticate(trim($secret), $token)) {
+    Logger::log('webhook_rejected', ['status' => 401, 'reason' => 'invalid_token']);
     respond(401, ['error' => 'Invalid webhook token.']);
 }
 
 if (stripos($_SERVER['CONTENT_TYPE'] ?? '', 'application/json') !== 0) {
+    Logger::log('webhook_rejected', ['status' => 415, 'reason' => 'content_type']);
     respond(415, ['error' => 'Content-Type must be application/json.']);
 }
 $raw = file_get_contents('php://input', false, null, 0, 1048577);
 if ($raw === false || strlen($raw) > 1048576) {
+    Logger::log('webhook_rejected', ['status' => 413, 'reason' => 'payload_too_large']);
     respond(413, ['error' => 'Payload exceeds the 1 MiB limit.']);
 }
 try {
@@ -44,11 +48,14 @@ try {
         throw new \InvalidArgumentException('Expected a JSON object.');
     }
 } catch (\JsonException | \InvalidArgumentException $exception) {
+    Logger::log('webhook_rejected', ['status' => 400, 'reason' => 'invalid_json']);
     respond(400, ['error' => 'Invalid JSON payload.']);
 }
 
+// Acceptance makes no remote API calls: it validates, persists, and acknowledges.
+// scripts/queue-worker.php performs enrichment; the twice-daily sweep reconciles.
 try {
-    [$config, $an, $enricher] = constituencyService();
+    [$config, $an] = constituencyService();
 } catch (\Throwable $exception) {
     Logger::log('webhook_configuration_error', ['error' => $exception->getMessage()]);
     respond(503, ['error' => 'Service configuration error; see server logs.']);
@@ -56,20 +63,15 @@ try {
 try {
     $ids = Webhook::personIds($payload, $an);
 } catch (\Throwable $exception) {
+    Logger::log('webhook_rejected', ['status' => 400, 'reason' => 'no_person_identity']);
     respond(400, ['error' => 'Payload must identify an Action Network person.']);
 }
-$outcomes = [];
-$failures = 0;
-foreach ($ids as $id) {
-    try {
-        $outcome = $enricher->process($id, 'webhook');
-        $outcomes[$outcome] = ($outcomes[$outcome] ?? 0) + 1;
-    } catch (\Throwable $exception) {
-        $failures++;
-    }
+try {
+    // Only person IDs are stored: never the token, request body, or headers.
+    $jobId = (new Queue($config->queueDirectory))->enqueue($ids);
+} catch (\Throwable $exception) {
+    Logger::log('webhook_queue_error', ['error' => $exception->getMessage()]);
+    respond(503, ['error' => 'Webhook could not be queued; retry later.']);
 }
-if ($failures > 0) {
-    respond(503, ['error' => 'Enrichment failed; retry later. The cron sweep will also retry.',
-        'outcomes' => $outcomes, 'errors' => $failures]);
-}
-respond(200, count($ids) === 1 ? ['outcome' => array_key_first($outcomes)] : ['outcomes' => $outcomes]);
+Logger::log('webhook_queued', ['job_id' => $jobId, 'people' => count($ids)]);
+respond(200, ['accepted' => true, 'job_id' => $jobId, 'people' => count($ids)]);
