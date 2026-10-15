@@ -45,7 +45,7 @@ final class Queue
             throw new \InvalidArgumentException('A queue job needs at least one person.');
         }
         $now ??= microtime(true);
-        $id = sprintf('%s%06d-%s', gmdate('YmdHis', (int) $now), (int) (fmod($now, 1) * 1000000),
+        $id = sprintf('%s%06d-%s', gmdate('YmdHis', (int) $now), min(999999, (int) (fmod($now, 1) * 1000000)),
             bin2hex(random_bytes(8)));
         $this->write('pending', [
             'version' => 1,

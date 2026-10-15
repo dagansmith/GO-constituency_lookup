@@ -110,7 +110,6 @@ $match = ['items' => [
     ['value' => ['name' => 'Historical name', 'endDate' => '2024-05-30T00:00:00']],
     ['value' => ['name' => 'Cities of London and Westminster', 'endDate' => null]],
 ]];
-$person2 = ['identifiers' => ['action_network:person-2']] + $person;
 $correct = $person;
 $correct['custom_fields']['parliamentary_constituency'] = 'Cities of London and Westminster';
 $newWorker = static function (Queue $queue, FakeHttpClient $http) use ($config): QueueWorker {
