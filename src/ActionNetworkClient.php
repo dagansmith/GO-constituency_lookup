@@ -23,7 +23,24 @@ final class ActionNetworkClient
 
     public function people(): \Generator
     {
-        $url = $this->config->anBaseUrl . '/people';
+        return $this->peoplePages($this->config->anBaseUrl . '/people');
+    }
+
+    public function peopleModifiedSince(string $since): \Generator
+    {
+        $date = \DateTimeImmutable::createFromFormat('!Y-m-d\TH:i:s\Z', $since, new \DateTimeZone('UTC'));
+        if ($date === false || $date->format('Y-m-d\TH:i:s\Z') !== $since) {
+            throw new \InvalidArgumentException('Modified-date filter requires a UTC timestamp (YYYY-MM-DDTHH:MM:SSZ).');
+        }
+        // AN v2 documents $filter=modified_date gt <ISO8601>, without quotes.
+        // Results are not ordered by modified_date: consume every next-page link.
+        return $this->peoplePages($this->config->anBaseUrl . '/people?' . http_build_query(
+            ['$filter' => 'modified_date gt ' . $since], '', '&', PHP_QUERY_RFC3986
+        ));
+    }
+
+    private function peoplePages(string $url): \Generator
+    {
         $seen = [];
         while ($url !== null) {
             $this->validateApiUrl($url);
