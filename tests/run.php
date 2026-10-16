@@ -14,6 +14,8 @@ use Constituency\ParliamentLookup;
 use Constituency\Postcode;
 use Constituency\Queue;
 use Constituency\QueueWorker;
+use Constituency\SweepCheckpoint;
+use Constituency\Sweeper;
 use Constituency\Webhook;
 
 final class FakeHttpClient extends HttpClient
@@ -70,9 +72,9 @@ function editJob(string $directory, string $state, callable $edit): void
     file_put_contents($path, json_encode($edit($job), JSON_PRESERVE_ZERO_FRACTION));
 }
 
-function runCli(array $arguments, array $env): array
+function runCli(array $arguments, array $env, string $script = 'queue-worker.php'): array
 {
-    $process = proc_open(array_merge([PHP_BINARY, dirname(__DIR__) . '/scripts/queue-worker.php'], $arguments),
+    $process = proc_open(array_merge([PHP_BINARY, dirname(__DIR__) . '/scripts/' . $script], $arguments),
         [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, null,
         $env + ['PATH' => (string) getenv('PATH')]);
     fclose($pipes[0]);
@@ -278,6 +280,177 @@ $tests = [
         $first['_links']['next']['href'] = $config->anBaseUrl . '/../people';
         $http->responses = [$first];
         fails(static fn () => iterator_to_array($an->people()));
+    },
+    'sweeper modified-date query follows every page and rejects unsafe links' => static function () use ($config, $person): void {
+        $http = new FakeHttpClient();
+        $an = new ActionNetworkClient($http, $config);
+        $since = '2026-10-15T12:30:00Z';
+        $url = $config->anBaseUrl . '/people?' . http_build_query(
+            ['filter' => "modified_date gt '$since'"], '', '&', PHP_QUERY_RFC3986
+        );
+        $next = $url . '&page=2';
+        $page = ['_embedded' => ['osdi:people' => [$person]],
+            '_links' => ['next' => ['href' => $next]]];
+        $http->responses = [$page, ['_embedded' => ['osdi:people' => [$person]]]];
+        same(2, count(iterator_to_array($an->peopleModifiedSince($since))));
+        same([$url, $next], array_column($http->calls, 'url'));
+        foreach (['?page=2', '?page=2&filter=modified_date%20gt%20%272026-10-16%27'] as $nextQuery) {
+            $page['_links']['next']['href'] = $config->anBaseUrl . '/people' . $nextQuery;
+            $http->responses = [$page, ['_embedded' => ['osdi:people' => [$person]]]];
+            same(2, count(iterator_to_array($an->peopleModifiedSince($since))));
+            parse_str(parse_url(end($http->calls)['url'], PHP_URL_QUERY), $query);
+            same(['page' => '2', 'filter' => "modified_date gt '$since'"], $query);
+        }
+        foreach (['https://evil.example/people', $url] as $badLink) {
+            $page['_links']['next']['href'] = $badLink;
+            $http->responses = [$page];
+            fails(static fn () => iterator_to_array($an->peopleModifiedSince($since)));
+            same([], $http->responses);
+        }
+        foreach (['yesterday', '2026-02-30T00:00:00Z', '2026-10-15T12:30:00+01:00', "$since or x"] as $invalid) {
+            fails(static fn () => iterator_to_array($an->peopleModifiedSince($invalid)));
+        }
+    },
+    'sweeper checkpoint missing, atomic replacement, corruption and write failures' => static function () use ($workRoot): void {
+        $path = $workRoot . '/checkpoint/state.json';
+        $checkpoint = new SweepCheckpoint($path);
+        same(null, $checkpoint->read());
+        $checkpoint->write(1000);
+        same(1000, $checkpoint->read());
+        $checkpoint->write(2000);
+        same(2000, $checkpoint->read());
+        same(0600, fileperms($path) & 0777);
+        same(0700, fileperms(dirname($path)) & 0777);
+        same([$path], glob(dirname($path) . '/*'));
+        file_put_contents($path, '{"version":1,"completed_through":"not-a-date"}');
+        fails(static fn () => $checkpoint->read());
+        file_put_contents($path, '');
+        fails(static fn () => $checkpoint->read());
+        file_put_contents($path, '"scalar"');
+        fails(static fn () => $checkpoint->read());
+        $alias = $workRoot . '/checkpoint-alias.json';
+        symlink($path, $alias);
+        fails(static fn () => (new SweepCheckpoint($alias))->read());
+        fails(static fn () => (new SweepCheckpoint($alias))->write(3000));
+        $blocked = $workRoot . '/checkpoint-blocked';
+        file_put_contents($blocked, 'not a directory');
+        fails(static fn () => (new SweepCheckpoint($blocked . '/state.json'))->write(2000));
+        same('not a directory', file_get_contents($blocked));
+    },
+    'sweeper default incremental overlap, initial history, full and dry-run semantics' => static function () use ($workRoot, $config, $person, $match): void {
+        $path = $workRoot . '/sweep-modes/state.json';
+        $checkpoint = new SweepCheckpoint($path);
+        $http = new FakeHttpClient();
+        $an = new ActionNetworkClient($http, $config);
+        $sweeper = new Sweeper($an, new Enricher($an,
+            new ParliamentLookup($http, $config->parliamentUrl), $config), $checkpoint, 300, 0);
+        $empty = ['_embedded' => ['osdi:people' => []]];
+        $http->responses = [$empty];
+        $summary = $sweeper->run(now: 10000);
+        same('incremental', $summary['mode']);
+        same('1970-01-01T00:00:00Z', $summary['window_start']);
+        same('1970-01-01T02:46:40Z', $summary['window_end']);
+        same(true, $summary['checkpoint_advanced']);
+        same(10000, $checkpoint->read());
+        $http->responses = [$empty];
+        $summary = $sweeper->run(now: 11000);
+        same(gmdate('Y-m-d\TH:i:s\Z', 9700), $summary['window_start']);
+        same(11000, $checkpoint->read());
+        $http->responses = [['_embedded' => ['osdi:people' => [$person]]], $person, $match];
+        $summary = $sweeper->run(dryRun: true, now: 12000);
+        same(1, $summary['would_update']);
+        same(false, $summary['checkpoint_advanced']);
+        same(11000, $checkpoint->read());
+        $http->responses = [$empty];
+        $summary = $sweeper->run(full: true, dryRun: true, now: 12000);
+        same('full', $summary['mode']);
+        same(null, $summary['window_start']);
+        same($config->anBaseUrl . '/people', end($http->calls)['url']);
+        same(11000, $checkpoint->read());
+        $http->responses = [['_embedded' => ['osdi:people' => [$person]]], $person, []];
+        $summary = $sweeper->run(full: true, now: 12000);
+        same(true, $summary['checkpoint_advanced']);
+        same(1, $summary['processed']);
+        same(1, $summary['updated']);
+        same(12000, $checkpoint->read());
+        $newCheckpoint = new SweepCheckpoint($workRoot . '/lookback/state.json');
+        $sweeper = new Sweeper($an, new Enricher($an,
+            new ParliamentLookup($http, $config->parliamentUrl), $config), $newCheckpoint, 300, 3600);
+        $http->responses = [$empty];
+        same(gmdate('Y-m-d\TH:i:s\Z', 6100), $sweeper->run(dryRun: true, now: 10000)['window_start']);
+        same(null, $newCheckpoint->read());
+    },
+    'sweeper failures and future checkpoints never advance state' => static function () use ($workRoot, $config, $person): void {
+        $checkpoint = new SweepCheckpoint($workRoot . '/sweep-errors/state.json');
+        $checkpoint->write(10000);
+        $http = new FakeHttpClient();
+        $an = new ActionNetworkClient($http, $config);
+        $sweeper = new Sweeper($an, new Enricher($an,
+            new ParliamentLookup($http, $config->parliamentUrl), $config), $checkpoint, 300, 0);
+        $page = ['_embedded' => ['osdi:people' => [$person]],
+            '_links' => ['next' => ['href' => $config->anBaseUrl . '/people?page=2']]];
+        $http->responses = [$page, ['postal_addresses' => []], new RuntimeException('Page failed.')];
+        same(1, $sweeper->run(now: 11000)['errors']);
+        same(10000, $checkpoint->read());
+        $http->responses = [['_embedded' => ['osdi:people' => [$person, $person]]],
+            new RuntimeException('Person failed.'), ['postal_addresses' => []]];
+        $summary = $sweeper->run(now: 11000);
+        same(2, $summary['processed']);
+        same(1, $summary['errors']);
+        same(1, $summary['invalid_postcode']);
+        same(10000, $checkpoint->read());
+        $http->responses = [];
+        $callsBeforeFailure = count($http->calls);
+        same(1, $sweeper->run(now: 9000)['errors']);
+        same(10000, $checkpoint->read());
+        file_put_contents($workRoot . '/sweep-errors/state.json', 'broken');
+        same(1, $sweeper->run(now: 11000)['errors']);
+        same($callsBeforeFailure, count($http->calls));
+        $http->responses = [['_embedded' => ['osdi:people' => []]]];
+        same(true, $sweeper->run(full: true, now: 11000)['checkpoint_advanced']);
+        $blocked = $workRoot . '/sweep-write-blocked';
+        file_put_contents($blocked, 'not a directory');
+        $sweeper = new Sweeper($an, new Enricher($an,
+            new ParliamentLookup($http, $config->parliamentUrl), $config),
+            new SweepCheckpoint($blocked . '/state.json'), 300, 0);
+        $http->responses = [['_embedded' => ['osdi:people' => []]]];
+        $summary = $sweeper->run(full: true, now: 12000);
+        same(1, $summary['errors']);
+        same(false, $summary['checkpoint_advanced']);
+    },
+    'sweeper CLI flags and lock prevent remote work' => static function () use ($workRoot, $testEnv): void {
+        $env = array_replace($testEnv, ['SWEEP_CHECKPOINT_PATH' => $workRoot . '/cli-checkpoint.json']);
+        $lock = new Lock($testEnv['LOCK_DIRECTORY'], 'sweeper');
+        foreach ([[], ['--full'], ['--dry-run'], ['--full', '--dry-run'], ['--dry-run', '--full']] as $flags) {
+            [$status, $summary] = runCli($flags, $env, 'sweeper.php');
+            same(1, $status);
+            same(in_array('--full', $flags, true) ? 'full' : 'incremental', $summary['mode']);
+            same(in_array('--dry-run', $flags, true), $summary['dry_run']);
+            same(0, $summary['processed']);
+            same(false, $summary['checkpoint_advanced']);
+        }
+        foreach ([['--unknown'], ['--full', '--full']] as $flags) {
+            same(2, runCli($flags, $env, 'sweeper.php')[0]);
+        }
+        same(0, runCli(['--help'], $env, 'sweeper.php')[0]);
+        same(false, file_exists($env['SWEEP_CHECKPOINT_PATH']));
+    },
+    'sweeper configuration rejects unsafe paths and invalid intervals' => static function () use ($workRoot): void {
+        foreach (['SWEEP_OVERLAP_SECONDS' => ['0', '-1', 'abc', '604801'],
+            'SWEEP_INITIAL_LOOKBACK_SECONDS' => ['-1', '1.5', '315360001'],
+            'SWEEP_CHECKPOINT_PATH' => ['relative/file', '/', '/tmp/../state.json',
+                dirname(__DIR__) . '/public/state.json', $workRoot]] as $key => $values) {
+            foreach ($values as $value) {
+                putenv("$key=$value");
+                fails(static fn () => new Config());
+            }
+            putenv($key);
+        }
+        $link = $workRoot . '/public-alias';
+        symlink(dirname(__DIR__) . '/public', $link);
+        putenv("SWEEP_CHECKPOINT_PATH=$link/new/state.json");
+        fails(static fn () => new Config());
+        putenv('SWEEP_CHECKPOINT_PATH');
     },
     'locks serialize processing and release after failure' => static function () use ($lockDirectory): void {
         $lock = new Lock($lockDirectory, 'test');
@@ -541,8 +714,13 @@ $tests = [
 ];
 
 $failures = 0;
+$executed = 0;
 try {
     foreach ($tests as $name => $test) {
+        if (isset($argv[1]) && !str_contains($name, $argv[1])) {
+            continue;
+        }
+        $executed++;
         try {
             $test();
             echo "PASS: $name\n";
@@ -560,5 +738,5 @@ try {
     }
     removeTree($workRoot);
 }
-echo count($tests) . " tests, $failures failures\n";
+echo "$executed tests, $failures failures\n";
 exit($failures === 0 ? 0 : 1);

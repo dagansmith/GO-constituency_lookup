@@ -23,10 +23,31 @@ final class ActionNetworkClient
 
     public function people(): \Generator
     {
-        $url = $this->config->anBaseUrl . '/people';
+        return $this->peoplePages($this->config->anBaseUrl . '/people');
+    }
+
+    public function peopleModifiedSince(string $since): \Generator
+    {
+        $date = \DateTimeImmutable::createFromFormat('!Y-m-d\TH:i:s\Z', $since, new \DateTimeZone('UTC'));
+        if ($date === false || $date->format('Y-m-d\TH:i:s\Z') !== $since) {
+            throw new \InvalidArgumentException('Modified-date filter requires a UTC timestamp (YYYY-MM-DDTHH:MM:SSZ).');
+        }
+        // AN v2's OData dialect uses filter (no "$") and single-quoted values.
+        // Results are not ordered by modified_date: consume every next-page link.
+        return $this->peoplePages($this->config->anBaseUrl . '/people', "modified_date gt '$since'");
+    }
+
+    private function peoplePages(string $url, ?string $filter = null): \Generator
+    {
         $seen = [];
         while ($url !== null) {
             $this->validateApiUrl($url);
+            if ($filter !== null) {
+                // Keep the original window even if a next link omits/changes its filter.
+                parse_str(parse_url($url, PHP_URL_QUERY) ?? '', $query);
+                $query['filter'] = $filter;
+                $url = explode('?', $url, 2)[0] . '?' . http_build_query($query, '', '&', PHP_QUERY_RFC3986);
+            }
             if (isset($seen[$url])) {
                 throw new \RuntimeException('Action Network returned a pagination loop.');
             }

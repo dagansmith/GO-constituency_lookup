@@ -4,8 +4,9 @@
 Vanilla PHP service that enriches Action Network (AN) people with their current UK
 parliamentary constituency. Webhooks provide the fast path: the endpoint validates
 and **durably queues** each delivery, then a **queue worker run by cron every
-minute** performs the enrichment. A **twice-daily full sweep** reconciles missed
-webhooks, failed writes, and changed postcodes.
+minute** performs the enrichment. A **daily incremental sweep** reconciles missed
+updates using Action Network's `modified_date` filter and a durable checkpoint.
+Full backfills/audits remain available with `--full`.
 
 ## Requirements and setup
 
@@ -47,7 +48,8 @@ webhooks, failed writes, and changed postcodes.
 6. Configure AN webhooks for the relevant supporter/action events available to
    your account, targeting `/webhook.php`. Check an actual payload against the
    contract below. Not every AN event or manual edit necessarily emits a webhook;
-   the full sweep is the safety net.
+   the incremental sweep catches modified records missed by webhooks; use a full
+   sweep for backfills and periodic audits of older unchanged records.
 
 ## Configuration
 
@@ -62,6 +64,9 @@ webhooks, failed writes, and changed postcodes.
 | `WEBHOOK_SECRET` | Required for webhook; at least 32 characters. Cron does not require it. |
 | `LOCK_DIRECTORY` | Repository `var/locks`; private absolute directory outside the public root. |
 | `QUEUE_DIRECTORY` | Repository `var/queue`; private absolute directory outside the public root (paths with `..` or inside `public/` are rejected). |
+| `SWEEP_CHECKPOINT_PATH` | Repository `var/sweeper/checkpoint.json`; private absolute file path outside `public/`, writable by the cron user. Preserve/back up across deployments. |
+| `SWEEP_OVERLAP_SECONDS` | `300` (five minutes); allowed 1–604800. Query from the previous successful run's start minus this overlap. |
+| `SWEEP_INITIAL_LOOKBACK_SECONDS` | `0` (all history) if no checkpoint exists; allowed 0–315360000. A positive value limits the initial lookback, plus overlap, and deliberately skips older unchanged people. |
 | `HTTP_RETRIES` | `2` additional attempts; allowed 0–5. |
 | `HTTP_TIMEOUT_SECONDS` | `15` per attempt; allowed 1–60. Connection timeout is at most 5 seconds. |
 
@@ -139,7 +144,7 @@ and reads `latestHouseMembership.membershipFrom` from a current Commons member.
 This fallback also requires one unambiguous constituency and shares the cache.
 If the constituency search cannot resolve a postcode and the seat is vacant
 (or Parliament is dissolved), the fallback may return `no_match`; the existing
-value is preserved and cron retries later.
+value is preserved; a later modification or full audit retries the lookup.
 
 AN person updates use **PUT**, not PATCH, with only the destination
 `custom_fields` entry. Other fields are not sent or replaced. An exact existing
@@ -151,22 +156,23 @@ Network failures, 429, and 5xx receive bounded exponential retries (1s, 2s by
 default). `Retry-After` is respected up to a 5-second delay cap; persistent
 throttling is left for the queue's retry schedule and the next sweep. Other
 non-2xx responses fail immediately. Invalid/no-match results leave any existing
-value untouched and are rechecked by the sweep.
+value untouched and are rechecked when selected by a later sweep.
 
 **No database or per-person status custom fields are required.** Besides the
-small webhook queue, AN is the durable source of truth: every sweep follows all `osdi:people` pages visible
-to the token, then re-reads and processes each person. This catches stale as well
-as missing constituency values, and retries failures even if a webhook never
-arrived. JSON logs record UTC timestamp, opaque person ID, source, and outcome or
+small webhook queue and sweep checkpoint, AN is the durable source of truth:
+incremental sweeps follow **all filtered pages**, then re-read and process each
+matching person. This catches stale as well as missing constituency values for
+modified people even if a webhook never arrived. JSON logs record UTC timestamp, opaque person ID, source, and outcome or
 sanitized error; no postcode, email, token, or API response body is logged.
 
-Tradeoffs: each run scans the entire group, with one fresh AN GET per person plus
-page requests, Parliament lookups per distinct postcode, and writes only for
-changes. There is no checkpoint: pagination failure stops that run, logs an
-error, and the next run restarts from page one. Monitor failures and runtime,
-especially for large groups; a permanently failing early page requires operator
-attention. Invalid and no-match postcodes are retried every sweep. Recovery may
-take up to 12 hours, longer during an ongoing outage.
+Tradeoffs: each run makes one fresh AN GET per matching person plus page
+requests, Parliament lookups per distinct postcode, and writes only for changes.
+Sweep API/processing failures preserve the checkpoint, so the next run replays
+the window safely. Monitor failures and runtime; a permanently failing person or
+page prevents progress and requires operator attention. Invalid/no-match inputs
+are non-error outcomes and do not block progress; **older unchanged records are
+not retried indefinitely**. Use `--full` periodically or after Parliament data,
+mapping rules, or configuration changes to audit them.
 
 Filesystem locks prevent overlapping sweeps and workers, and serialize a person's
 processing between the queue worker and the sweep on **one host/shared locking filesystem**. Keep lock
@@ -199,7 +205,8 @@ Queue layout under `QUEUE_DIRECTORY` (server-generated job IDs such as
 - Failure: retried after 1, 2, 4, 8, 16, 32, then 60 minutes; the attempt is
   counted before work starts, so a job that repeatedly crashes the worker also
   ends up failed. After 10 attempts (about 4½ hours) it moves to `failed/` and
-  logs `queue_job_failed`. The twice-daily sweep still reconciles that person.
+  logs `queue_job_failed`. Investigate/requeue terminal failures; an incremental
+  sweep only selects the person while their modification is within its window.
 - Duplicates: deliveries are **at least once**, not exactly once. Within one run,
   a job for a person whose fresh read *started after the job was received* is
   skipped as covered (`duplicates_skipped`); otherwise processing is idempotent
@@ -226,33 +233,89 @@ files contain AN person IDs; keep the directory private and back it up with the
 application. Multi-host deployments need a shared filesystem for the queue and
 locks or a single worker host.
 
-## Cron: every-minute worker and twice-daily sweep
+## Cron: every-minute worker and daily incremental sweep
 
 Use absolute paths, the same OS user as the web PHP process, and a pre-created
 private log directory. The worker runs every minute (if your host only allows a
 coarser schedule, use the smallest it allows; queued jobs simply wait longer).
-The sweep stays twice daily as reconciliation (midnight and noon **in the cron
-host's timezone**); do not turn it into a minute job — it scans the whole group.
+Run incremental reconciliation daily at 03:00 **in the cron host's timezone**;
+do not schedule full-group scans twice daily. Adjust incremental frequency to
+your recovery needs. Only the first run without a checkpoint scans all history
+by default.
 
 ```cron
 * * * * * /usr/bin/php /opt/constituency-lookup/scripts/queue-worker.php >> /var/log/constituency-lookup/queue-worker.log 2>&1
-0 0,12 * * * /bin/sh -c 'set -a; . /opt/constituency-lookup/.env; set +a; exec /usr/bin/php /opt/constituency-lookup/scripts/sweeper.php' >> /var/log/constituency-lookup/sweeper.log 2>&1
+0 3 * * * /usr/bin/php /opt/constituency-lookup/scripts/sweeper.php >> /var/log/constituency-lookup/sweeper.log 2>&1
 ```
 
-The worker needs no shell sourcing because the bootstrap reads `.env`; the
-existing sourced sweeper line keeps working (sourced values take precedence and
-are identical). The worker writes about one short JSON line per minute: rotate
+Neither script needs shell sourcing because the bootstrap reads `.env`;
+existing sourced lines still work (environment values take precedence).
+Use **`scripts/queue-worker.php`**, not `scripts/webhook_worker.php` or an
+underscore variant. Keep the two cron entries on separate lines and use `>>`
+to append logs. The worker writes about one short JSON line per minute: rotate
 or truncate its log periodically and alert on repeated non-zero exits, a growing
 `--status` `oldest_pending_age_seconds`, or any `failed` count.
 
-Sweeper:
+### Incremental sweeper and backfill
+
+```sh
+php /opt/constituency-lookup/scripts/sweeper.php                 # incremental (default)
+php /opt/constituency-lookup/scripts/sweeper.php --dry-run       # read-only incremental
+php /opt/constituency-lookup/scripts/sweeper.php --full --dry-run # read-only audit
+php /opt/constituency-lookup/scripts/sweeper.php --full          # full backfill/audit
+```
+
+- Incremental uses AN v2's `filter=modified_date gt 'TIMESTAMP'` (no `$` prefix).
+  UTC timestamps use `YYYY-MM-DDTHH:MM:SSZ`. All pagination links are followed;
+  the original filter is retained even if a next-page link omits it. Results are
+  **not assumed to be ordered by modification date**.
+- Query start is the last successful checkpoint minus `SWEEP_OVERLAP_SECONDS`.
+  `window_end` is the run's start time and the next checkpoint, **not an API upper
+  bound**: newer records may also be returned and safely reprocessed next time.
+  Choose overlap to cover expected clock skew/API visibility delays; delays
+  longer than that can require a full audit.
+- **First run:** no checkpoint defaults to querying from the Unix epoch, covering
+  all history. Expect full-scan cost once, even if every constituency is already
+  populated. If a recent backfill is known complete, you may explicitly set
+  `SWEEP_INITIAL_LOOKBACK_SECONDS=86400` to seed from the last day plus overlap;
+  this intentionally excludes older unchanged records.
+- A non-dry successful incremental **or full** sweep atomically writes the run's
+  start time to the checkpoint (0700 directory / 0600 file). Full mode bypasses
+  checkpoint reads and can rebuild corrupt state. Any page, person, lock, or
+  checkpoint-write failure leaves the previous checkpoint in place. Processing
+  is synchronous, not enqueued; the existing per-person locking/idempotence is
+  shared with the worker, whose webhook/retry behavior is unchanged.
+- Dry runs neither update AN **nor advance/create the checkpoint**. Repeated
+  dry runs therefore read the same window. AN constituency writes themselves
+  change `modified_date`; a subsequent sweep may see those people again, but
+  exact matching values are not rewritten.
+- Preserve the checkpoint across deployments. Missing state triggers the safe
+  all-history initial run (unless a limited lookback is configured); corrupt,
+  unreadable, or future-dated state fails closed. Check permissions/clock and
+  restore a trusted backup or run `--full` to rebuild. Do not edit state while
+  a sweep holds its lock.
 
 `--dry-run` performs real reads/lookups and reports `would_update`, but **never
-writes to AN**. Final stdout is a JSON counter summary. Exit code 0 means the scan
+writes to AN**. Final stdout is a JSON line with `event: "sweep_completed"`,
+`time`, `mode`, `dry_run`, `window_start` (`null` for full scans), `window_end`
+(UTC), `checkpoint_advanced`, and the existing outcome/error counters.
+An event name alone does not imply success: check `errors` and exit code.
+Exit code 0 means the scan
 completed without API/processing errors (invalid/no-match inputs have separate
 counters); 1 means failure or an overlapping sweep; 2 means invalid CLI arguments.
-Per-person failures do not stop the scan. Rotate/restrict logs and alert on
-nonzero exit codes, invalid/no-match counts, and runs that fail to complete.
+Per-person failures do not stop the scan but prevent checkpoint advancement.
+Rotate/restrict logs and alert on nonzero exit codes, invalid/no-match counts,
+repeated `checkpoint_advanced: false` outside dry runs, and runs that fail to
+complete. To inspect without starting an expensive scan:
+
+```sh
+tail -n 30 /var/log/constituency-lookup/sweeper.log
+cat /opt/constituency-lookup/var/sweeper/checkpoint.json
+```
+
+Use the configured checkpoint/log paths if overridden. For older unchanged
+records, run a manual `--full` audit after lookup changes or on a suitable
+low-frequency maintenance schedule.
 
 ## Local checks
 
@@ -266,7 +329,8 @@ find /absolute/path/to/GO-constituency_lookup/src /absolute/path/to/GO-constitue
 Tests use synthetic responses and no live credentials/API writes. They cover
 postcode validation, authentication, cache behavior, current vs historical
 results, idempotence, dry-run, recovery, pagination safety, locks, `.env`
-parsing, and the queue: the real `webhook.php` served by PHP's built-in server
+parsing, incremental URL/pagination safety, overlap, checkpoint failure handling,
+full/dry-run/CLI semantics, and the queue: the real `webhook.php` served by PHP's built-in server
 on localhost (auth/content-type/size/JSON/identity rejections, 503 on an
 unwritable queue, token never stored) followed by worker enrichment, partial
 multi-person failure, retry backoff, terminal failures and requeue, duplicates,
@@ -458,13 +522,16 @@ under 32 characters (check the PHP error log for `env_file_error`).
    constituency (not `queue-test`). Only this confirms the eventual update.
    `--status` should show the job is gone.
 
-### 7. Schedule the worker
+### 7. Schedule the worker and incremental sweeper
 
-Add a cron job in the 20i panel (or `crontab -e`), keeping the existing sweeper
-entry unchanged:
+Add/replace these two separate cron entries in the 20i panel (or `crontab -e`).
+Replace the old twice-daily sweep and any `webhook_worker.php` entry, rather than
+leaving duplicate jobs. The first sweep may still scan all history; see the
+checkpoint/initial-lookback guidance above.
 
 ```cron
 * * * * * /usr/php83/usr/bin/php /home/virtual/vps-16f9df/1/13bd028939/apps/GO-constituency_lookup/scripts/queue-worker.php >> /home/virtual/vps-16f9df/1/13bd028939/apps/GO-constituency_lookup/var/logs/queue-worker.log 2>&1
+0 3 * * * /usr/php83/usr/bin/php /home/virtual/vps-16f9df/1/13bd028939/apps/GO-constituency_lookup/scripts/sweeper.php >> /home/virtual/vps-16f9df/1/13bd028939/apps/GO-constituency_lookup/var/logs/sweeper.log 2>&1
 ```
 
 If the panel cannot run every minute, use its smallest interval. After a few
@@ -516,9 +583,10 @@ between runs; leftovers are recovered automatically by the next run.
    $PHP -l src/bootstrap.php
    ```
    The old synchronous webhook is then live again (and slower than AN's test).
-4. Any jobs left in `var/queue/pending` stay on disk untouched; the twice-daily
-   sweep still reconciles those people. Redeploying the queue code and its cron
-   later processes them.
+4. Any jobs left in `var/queue/pending` stay on disk untouched. Preserve the sweep
+   checkpoint too. Older sweeper code may perform full scans; review its cron
+   frequency on rollback. Redeploying the queue code and its cron later processes
+   retained jobs.
 
 ## Troubleshooting
 

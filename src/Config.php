@@ -14,6 +14,9 @@ final class Config
     public readonly string $webhookSecret;
     public readonly string $lockDirectory;
     public readonly string $queueDirectory;
+    public readonly string $sweepCheckpointPath;
+    public readonly int $sweepOverlapSeconds;
+    public readonly int $sweepInitialLookbackSeconds;
     public readonly int $retries;
     public readonly int $timeout;
 
@@ -34,6 +37,9 @@ final class Config
         $this->webhookSecret = self::env('WEBHOOK_SECRET');
         $this->lockDirectory = self::env('LOCK_DIRECTORY', dirname(__DIR__) . '/var/locks');
         $this->queueDirectory = rtrim(self::env('QUEUE_DIRECTORY', dirname(__DIR__) . '/var/queue'), '/');
+        $this->sweepCheckpointPath = self::env('SWEEP_CHECKPOINT_PATH', dirname(__DIR__) . '/var/sweeper/checkpoint.json');
+        $this->sweepOverlapSeconds = self::integer('SWEEP_OVERLAP_SECONDS', 300, 1, 604800);
+        $this->sweepInitialLookbackSeconds = self::integer('SWEEP_INITIAL_LOOKBACK_SECONDS', 0, 0, 315360000);
         $this->retries = self::integer('HTTP_RETRIES', 2, 0, 5);
         $this->timeout = self::integer('HTTP_TIMEOUT_SECONDS', 15, 1, 60);
 
@@ -58,6 +64,20 @@ final class Config
             throw new \RuntimeException('LOCK_DIRECTORY must be an absolute path outside the public web root.');
         }
         $public = dirname(__DIR__) . '/public';
+        $ancestor = $this->sweepCheckpointPath;
+        while (!file_exists($ancestor) && !is_link($ancestor) && dirname($ancestor) !== $ancestor) {
+            $ancestor = dirname($ancestor);
+        }
+        $realAncestor = str_contains($ancestor, "\0") ? false : realpath($ancestor);
+        if (!str_starts_with($this->sweepCheckpointPath, '/') || str_ends_with($this->sweepCheckpointPath, '/')
+            || str_contains($this->sweepCheckpointPath, "\0")
+            || is_dir($this->sweepCheckpointPath)
+            || preg_match('~(?:^|/)\.\.?(?:/|$)~', $this->sweepCheckpointPath)
+            || str_starts_with($this->sweepCheckpointPath, $public . '/')
+            || ($realAncestor !== false
+                && str_starts_with($realAncestor . '/', (realpath($public) ?: $public) . '/'))) {
+            throw new \RuntimeException('SWEEP_CHECKPOINT_PATH must be an absolute file path outside the public web root.');
+        }
         $realQueue = realpath($this->queueDirectory);
         if (!str_starts_with($this->queueDirectory, '/') || preg_match('~(?:^|/)\.\.?(?:/|$)~', $this->queueDirectory)
             || str_starts_with($this->queueDirectory . '/', $public . '/')
