@@ -286,7 +286,7 @@ $tests = [
         $an = new ActionNetworkClient($http, $config);
         $since = '2026-10-15T12:30:00Z';
         $url = $config->anBaseUrl . '/people?' . http_build_query(
-            ['$filter' => "modified_date gt $since"], '', '&', PHP_QUERY_RFC3986
+            ['filter' => "modified_date gt '$since'"], '', '&', PHP_QUERY_RFC3986
         );
         $next = $url . '&page=2';
         $page = ['_embedded' => ['osdi:people' => [$person]],
@@ -294,6 +294,13 @@ $tests = [
         $http->responses = [$page, ['_embedded' => ['osdi:people' => [$person]]]];
         same(2, count(iterator_to_array($an->peopleModifiedSince($since))));
         same([$url, $next], array_column($http->calls, 'url'));
+        foreach (['?page=2', '?page=2&filter=modified_date%20gt%20%272026-10-16%27'] as $nextQuery) {
+            $page['_links']['next']['href'] = $config->anBaseUrl . '/people' . $nextQuery;
+            $http->responses = [$page, ['_embedded' => ['osdi:people' => [$person]]]];
+            same(2, count(iterator_to_array($an->peopleModifiedSince($since))));
+            parse_str(parse_url(end($http->calls)['url'], PHP_URL_QUERY), $query);
+            same(['page' => '2', 'filter' => "modified_date gt '$since'"], $query);
+        }
         foreach (['https://evil.example/people', $url] as $badLink) {
             $page['_links']['next']['href'] = $badLink;
             $http->responses = [$page];

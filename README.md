@@ -265,9 +265,10 @@ php /opt/constituency-lookup/scripts/sweeper.php --full --dry-run # read-only au
 php /opt/constituency-lookup/scripts/sweeper.php --full          # full backfill/audit
 ```
 
-- Incremental uses AN v2's `$filter` on `modified_date` with the `gt` operator.
+- Incremental uses AN v2's `filter=modified_date gt 'TIMESTAMP'` (no `$` prefix).
   UTC timestamps use `YYYY-MM-DDTHH:MM:SSZ`. All pagination links are followed;
-  results are **not assumed to be ordered by modification date**.
+  the original filter is retained even if a next-page link omits it. Results are
+  **not assumed to be ordered by modification date**.
 - Query start is the last successful checkpoint minus `SWEEP_OVERLAP_SECONDS`.
   `window_end` is the run's start time and the next checkpoint, **not an API upper
   bound**: newer records may also be returned and safely reprocessed next time.
